@@ -49,7 +49,8 @@ docker exec -ti <CONTAINER_NAME> bash
 
 7. Navigate to an analysis module and run the shell script:
 ```
-cd /home/rstudio/conway-cd52/analyses/module_of_interest
+cd /home/rstudio/conway-cd52/analyses/conway-cd52
+bash run_modules.sh
 ```
 
 ### Below is the level one directory structure listing the analyses and data files used in this repository

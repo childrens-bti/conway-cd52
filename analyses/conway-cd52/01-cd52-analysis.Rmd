@@ -1,0 +1,224 @@
+---
+title: "01-cd52-analysis"
+author: "Sam Chen"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+---
+
+## Set up
+```{r setup, include=FALSE}
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(rprojroot))
+
+# Define directories
+root_dir <- find_root(has_dir(".git"))
+data_dir <- file.path(root_dir, "data", "v1")
+analysis_dir <- file.path(root_dir, "analyses", "conway-cd52")
+results_dir <- file.path(analysis_dir, "results")
+plot_dir <- file.path(analysis_dir, "plots")
+dir.create(results_dir, showWarnings = F, recursive = T)
+dir.create(plot_dir, showWarnings = F, recursive = T)
+```
+
+# I. Load and clean data
+```{r load-data}
+load_conway_cd52_data <- function(sample){
+  
+  sample_name <- gsub("_", "-", sample)
+  
+  cd52pos <- read.csv(file.path(data_dir, sample, paste0(sample_name, "-CD52pos.csv"))) %>%
+    mutate(CD52_status = "CD52+")
+  cd52neg <- read.csv(file.path(data_dir, sample, paste0(sample_name, "-CD52neg.csv"))) %>%
+    mutate(CD52_status = "CD52-")
+  
+  df <- bind_rows(cd52pos, cd52neg)
+  df_long <- df %>%
+    select(file, CD52_status, matches("^Cluster.*\\.median$")) %>%
+    pivot_longer(
+      cols = matches("^Cluster.*\\.median$"),
+      names_to = "feature",
+      values_to = "value"
+    ) %>%
+    tidyr::extract(
+      feature,
+      into = c("cluster", "channel", "marker"),
+      regex = "^(Cluster\\d+)\\.(.+)___(.+)\\.median$"
+    ) %>%
+    dplyr::rename(condition = file) %>%
+    dplyr::mutate(
+      condition = case_when(
+        grepl("non[- ]?edited|unedited", condition, ignore.case = TRUE) ~ "unedited",
+        grepl("^edited| edited", condition, ignore.case = TRUE) ~ "edited",
+        TRUE ~ condition
+      ),
+      sample = sample) %>% 
+    dplyr::filter(marker != "Viability")
+  
+  df_long
+}
+
+samples <- c("CD52KO_BC0610", "CD52KO_BC8599", "CD52KO_BC9507")
+
+df_list <- lapply(samples, load_conway_cd52_data)
+names(df_list) <- samples
+```
+
+# II. Confirm CD52 expression patterns in samples
+This plot confirms that CD52 expression is high in the CD52+ samples and low in the CD52- samples, as expected. CD52 expressions are also generally lower in edited samples compared to unedited.
+```{r plot-cd52, fig.with=5, fig.height=5}
+cd52_df <- bind_rows(df_list) %>%
+  dplyr::filter(marker == "CD52")
+
+ggplot(cd52_df, aes(x = sample, y = value, fill = condition)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~CD52_status) +
+  theme_minimal() +
+  labs(
+    title = "CD52 expression across clusters and conditions",
+    x = "Sample",
+    y = "Median CD52 expression"
+  ) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# III. Annotate main T cell subtypes
+I roughly annotated clusters into main T cell subtypes (CD4, CD8, gamma-delta) based on the mean expression of key markers in each cluster. This is a rough annotation and may not be perfect, but it should help us check if the expected T cell subtypes are present in the CD52+ vs CD52- samples.
+```{r annotate-subtypes}
+annotate_tcell_subtypes <- function(df) {
+  cluster_anno <- df %>%
+    dplyr::filter(marker %in% c("CD3", "CD4", "CD8", "TCRab", "TCRgd")) %>%
+    group_by(sample, condition, CD52_status, cluster, marker) %>%
+    summarise(value = mean(value), .groups = "drop") %>%
+    pivot_wider(names_from = marker, values_from = value) %>%
+    mutate(
+      cell_type = case_when(
+        is.na(CD3) | CD3 <= 0 ~ "non-T/unclear",
+        TCRgd > TCRab ~ "gamma-delta T",
+        TCRab >= TCRgd & CD4 > CD8 ~ "CD4 T",
+        TCRab >= TCRgd & CD8 > CD4 ~ "CD8 T",
+        TRUE ~ "unknown"
+      )
+    )
+  
+  cluster_anno
+}
+
+df_long <- bind_rows(df_list)
+cluster_annotations <- annotate_tcell_subtypes(df_long)
+
+df_annot <- df_long %>%
+  left_join(
+    cluster_annotations %>%
+      select(sample, condition, CD52_status, cluster, cell_type),
+    by = c("sample", "condition", "CD52_status", "cluster")
+  )
+```
+
+Z-score heatmap of key T cell markers across clusters, faceted by sample, condition, and CD52 status. This should help us visually confirm the expected expression patterns of CD3, CD4, CD8, TCRab, and TCRgd in the annotated clusters.
+```{r zscore-heatmap, fig.width=6, fig.height=9}
+heatmap_df <- cluster_annotations %>%
+  pivot_longer(
+    cols = c(CD3, CD4, CD8, TCRab, TCRgd),
+    names_to = "marker",
+    values_to = "value"
+  ) %>%
+  group_by(sample, condition, CD52_status, marker) %>%
+  mutate(zscore = as.numeric(scale(value))) %>%
+  ungroup()
+
+ggplot(heatmap_df, aes(x = marker, y = cluster, fill = zscore)) +
+  geom_tile() +
+  facet_grid(sample ~ condition + CD52_status, scales = "free_y") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_y_discrete(limits = rev) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+This plot shows the mean expression of CD4, CD8, and TCRgd across clusters, faceted by annotated cell type. This confirms that the clusters annotated as CD4 T cells have higher CD4 expression, and those annotated as CD8 T cells have higher CD8 expression.
+``` {r check-annotaions, fig.width=10, fig.height=4}
+ggplot(cluster_annotations %>%
+         pivot_longer(c(CD4, CD8, TCRgd),
+                      names_to="marker",
+                      values_to="value"),
+       aes(cluster, value, fill=marker)) +
+  geom_col(position="dodge") +
+  facet_wrap(~cell_type) + 
+  theme_minimal() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+# IV. Check non-CD52 markers in CD52+ unedited vs CD52- edited T cell subtypes
+Facet grid of non-CD52 marker asingh normalized expression across samples, cell types, and conditions. This enabled visual inspections of any non-CD52 markers that show consistent differences between CD52+ unedited vs CD52- edited samples within CD4 and CD8 T cell subtypes. There are very few outliers at first glance. 
+```{r marker-distributions, fig.width=16, fig.height=8} 
+compare_df <- df_annot %>%
+  dplyr::filter(
+    (CD52_status == "CD52+" & condition == "unedited") |
+    (CD52_status == "CD52-" & condition == "edited")
+  ) %>%
+  mutate(
+    group = case_when(
+      CD52_status == "CD52+" & condition == "unedited" ~ "CD52+ control",
+      CD52_status == "CD52-" & condition == "edited" ~ "CD52- KO"),
+    value_asinh = asinh(value / 1000)
+  ) %>% 
+  dplyr::filter(cell_type %in% c("CD4 T", "CD8 T"))
+
+ggplot(compare_df %>% dplyr::filter(marker != "CD52"),
+       aes(marker, value_asinh, color = group)) +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.7) +
+  facet_grid(sample ~ cell_type)+
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Here I calculated the mean asinh-transformed expression of each protein marker in CD52+ unedited vs CD52- edited samples, and plotted them against each other. The red points indicate CD52 itself, which shows the expected pattern of high expression in CD52+ unedited and low expression in CD52- edited samples. Most other markers cluster around the diagonal, indicating similar expression levels between the two groups. 
+```{r scatter-plot, fig.width=7, fig.height=3}
+summary_df <- compare_df %>%
+  group_by(sample, marker, group) %>%
+  summarise(mean_asinh = mean(value_asinh), .groups="drop") %>%
+  pivot_wider(names_from = group, values_from = mean_asinh) %>%
+  mutate(CD52 = marker == "CD52")
+
+ggplot(summary_df,
+       aes(`CD52+ control`, `CD52- KO`, color=CD52)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "red")) +
+  facet_wrap(~sample) +
+  theme_bw() + labs(x = "CD52+ unedited", y = "CD52- edited (KO)")
+```
+
+I performed Wilcoxon rank-sum tests to compare the asinh-transformed expression of each marker between CD52+ unedited and CD52- edited clusters within each T cell subtypes and sample. The results are adjusted for multiple testing using the FDR method. The top 10 markers with the smallest adjusted p-values are shown below, and the full results are saved to a CSV file. CD52 itself shows a highly significant difference, as expected, while most other markers do not show significant differences. A few non-CD52 markers exhibiting nomimal significance may warrant further investigation, but overall there do not appear to be strong consistent differences in non-CD52 markers between the CD52+ unedited and CD52- edited samples within the main T cell subtypes.
+``` {r wilcox-test}
+wilcox_results <- compare_df %>%
+  group_by(sample, cell_type, marker) %>%
+  summarise(
+    p_value = wilcox.test(value_asinh ~ group, exact=FALSE)$p.value,
+    control_mean = mean(value_asinh[group == "CD52+ control"]),
+    KO_mean = mean(value_asinh[group == "CD52- KO"]),
+    .groups = "drop"
+  ) %>%
+  mutate(p_adj = p.adjust(p_value, method = "fdr"))
+
+wilcox_results %>%
+  arrange(p_adj) %>% top_n(10, wt = -p_adj)
+
+write.csv(wilcox_results %>% arrange(p_adj), file.path(results_dir, "wilcox_results.csv"), row.names = FALSE)
+```
+
+# V. Conclusion
+- CD52 expression is high in CD52+ samples and low in CD52- samples, confirming the expected patterns.
+- The main T cell subtypes (CD4, CD8, gamma-delta) are present in both CD52+ and CD52- samples, with expected marker expression patterns.
+- There are very few non-CD52 markers that show consistent differences between CD52+ unedited and CD52- edited samples within the CD4+ and CD8+ T cell subtypes, suggesting that CD52 KO may not have strong effects on the expression of other surface markers in these samples.
+
+# Session Info
+```{r session-info}
+sessionInfo()
+```

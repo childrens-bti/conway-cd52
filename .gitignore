@@ -47,3 +47,6 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Large generated analysis intermediates
+analyses/conway-cd52/results/conway_cd52_celltype_data.csv
