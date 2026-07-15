@@ -1,0 +1,588 @@
+---
+title: "02-cd52-celltype-de"
+author: "Sam Chen"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    code_folding: hide
+---
+
+# Set up
+```{r setup, include=FALSE}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(rprojroot))
+suppressPackageStartupMessages(library(ggrastr))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(diffcyt))
+suppressPackageStartupMessages(library(EnhancedVolcano))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+
+# Define directories
+root_dir <- find_root(has_dir(".git"))
+data_dir <- file.path(root_dir, "data", "v1", "conway-annotated")
+analysis_dir <- file.path(root_dir, "analyses", "conway-cd52")
+results_dir <- file.path(analysis_dir, "results")
+plot_dir <- file.path(analysis_dir, "plots")
+dir.create(results_dir, showWarnings = F, recursive = T)
+dir.create(plot_dir, showWarnings = F, recursive = T)
+
+source(file.path(analysis_dir, "util/helpers.R"))
+```
+
+# Load data
+A total of 18 samples are present in this dataset, including 9 edited and 9 unedited samples. The edited samples have CD52 knocked out, while the unedited samples serve as controls. 
+```{r load-data, message=FALSE, warning=FALSE}
+load_conway_cd52_celltype_data <- function() {
+  files <- list.files(data_dir)
+  full_df <- data.frame()
+  for (f in files) {
+    if (grepl("edited|unedited", f, ignore.case = TRUE)) {
+      sample_name <- gsub("_edited.csv|_unedited.csv", "", f)
+      condition <- ifelse(grepl("unedited", f, ignore.case = TRUE), "unedited", "edited")
+      df <- read_csv(file.path(data_dir, f))
+      df$sample <- sample_name
+      df$condition <- condition
+      
+      full_df <- bind_rows(full_df, df)
+    }
+  }
+  
+  full_df <- full_df %>%
+    # drop Time, AF-A, fsom-clust columns
+    dplyr::select(-matches("Time|AF-A|fsom-clust")) %>%
+    # clean up protein names
+    rename_with(~ sub(".*___", "", .x)) %>%
+    # rename specific column names
+    dplyr::rename(
+      cell_id = Orig_Row_Number, 
+      fsom_metaclust = `fsom-metaclust-elbow`,
+      celltype = OmiqFilter
+    ) %>%
+    # rename celltypes 
+    mutate(
+      celltype = forcats::fct_recode(
+        celltype,
+        "Mono" = "CD14+",
+        "B" = "CD19+",
+        "CD4+ Th17" = "CD4+/CD127+/Q1 CXCR3- / CCR6+/Th17",
+        "CD4+ Th22" = "CD4+/CD127+/Q1 CXCR3- / CCR6+/Th22", 
+        "CD4+ Th9" = "CD4+/CD127+/Q2 CXCR3+ / CCR6+/Th9",
+        "CD4+ Th2" = "CD4+/CD127+/Q4 CXCR3- / CCR6-/CXCR5, CCR4 Subset/Th2",
+        "CD4+ CM" = "CD4+/Central Mem",
+        "CD4+ EM" = "CD4+/Effector Mem",
+        "CD4+ Naive" = "CD4+/Naive/CD95-",
+        "CD4+ CD95+ Stem Mem" = "CD4+/Naive/CD95+",
+        "CD4+ TE" = "CD4+/Terminal Effector",
+        "CD8+ CM" = "CD8+/Central Mem",
+        "CD8+ EM" = "CD8+/Effector Mem",
+        "CD8+ Naive" = "CD8+/Naive/CD95-",
+        "CD8+ CD95+ Stem Mem" = "CD8+/Naive/CD95+",
+        "CD8+ TE" = "CD8+/Terminal Effector",
+        "NK" = "Q2 CD56+ / CD16+",
+        "CD4+ Th1" = "Q3 CXCR3+ / CCR6- Th1", 
+        "CD4+ TFH" = "Q4 CXCR3- / CCR6-/Germinal Center TfH Cells"
+      ),
+       celltype = factor(celltype),
+       fsom_metaclust = factor(fsom_metaclust), 
+       sample = factor(sample)
+    )
+    
+  full_df
+}
+
+df <- load_conway_cd52_celltype_data()
+# replace BC4432 to BC4423 due to typo in file name
+df$sample <- gsub("BC4432", "BC4423", df$sample)
+write_csv(df, file.path(results_dir, "conway_cd52_celltype_data.csv"))
+
+features <- df %>%
+  select(-cell_id, -sample, -condition, -fsom_metaclust, -celltype) %>% colnames()
+```
+# Visualize tSNE
+Each sample (~30k cells) contains a mixture of different immune cell types, with annotations obtained through FlowSOM clustering and manual gating done by flow cytometry core.
+```{r visualize-tsne, fig.width=16, fig.height=12, message=FALSE, warning=FALSE}
+# remove cell types with < 1000 cells
+df <- df %>%
+  group_by(celltype) %>%
+  dplyr::filter(n() >= 1000) %>%
+  ungroup()
+
+p1 <- ggplot(df, aes(x=optsne_1, y=optsne_2))+ 
+  geom_point_rast(aes(color = fsom_metaclust), size = 0.1, alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))+
+  ggtitle("FlowSOM metaclusters") +
+  theme_minimal()+
+  theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 18,
+        face = "bold" 
+      )
+  )
+
+p2 <- ggplot(df, aes(x=optsne_1, y=optsne_2))+ 
+  geom_point_rast(aes(color = celltype), size = 0.1, alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))+
+  ggtitle("Annotated cell types") +
+  scale_color_brewer(palette = "Spectral") + 
+  theme_minimal()+
+  theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 18,
+        face = "bold" 
+      )
+  )
+
+p3 <- ggplot(df, aes(x=optsne_1, y=optsne_2))+ 
+  geom_point_rast(aes(color = sample), size = 0.1, alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))+
+  ggtitle("Samples") +
+  scale_color_brewer(palette = "Set1") + 
+  theme_minimal() + 
+  theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 18,
+        face = "bold" 
+      )
+  )
+
+
+p4 <- ggplot(df, aes(x=optsne_1, y=optsne_2))+ 
+  geom_point_rast(aes(color = condition), size = 0.1, alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))+
+  ggtitle("CD52 Condition") +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 18,
+        face = "bold" 
+      )
+  )
+
+(p1 + p2) / (p3 + p4)
+
+ggsave(file.path(plot_dir, "tsne_plots.png"), (p1 + p2) / (p3 + p4), width = 16, height = 12)
+```
+
+```{r improved-tsne-1, fig.width=12, fig.height=8, message=FALSE, warning=FALSE}
+ggplot(df, aes(x=optsne_1, y=optsne_2))+ 
+  geom_point_rast(aes(color = celltype), size = 0.1, alpha = 0.3) +
+  facet_wrap(~ celltype) +
+  ggtitle("Annotated cell types") +
+  scale_color_brewer(palette = "Spectral")+
+  theme_minimal() +
+  theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 18,
+        face = "bold" 
+      ),
+      
+      strip.text = element_text(
+          size = 14,
+          face = "bold",  
+          hjust = 0.5 
+        ),
+      legend.position = "none"
+    )
+
+ggsave(file.path(plot_dir, "tsne_celltype_split.png"), width = 12, height = 8)
+```
+
+```{r improved-tsne-2, fig.width=12, fig.height=6, message=FALSE, warning=FALSE}
+ggplot(df, aes(x=optsne_1, y=optsne_2))+ 
+  geom_point_rast(aes(color = condition), size = 0.1, alpha = 0.3) +
+  facet_wrap(~ condition) +
+  ggtitle("CD52 Condition") +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 18,
+        face = "bold" 
+      ),
+      
+      strip.text = element_text(
+          size = 14,
+          face = "bold",  
+          hjust = 0.5 
+        ),
+      legend.position = "none"
+    )
+
+ggsave(file.path(plot_dir, "tsne_condition_split.png"), width = 12, height = 6)
+```
+
+# Define CD52 positive and negative cells
+The status of CD52 expression is clearly bimodal, with a natural cutoff around 2. We will use this cutoff to define CD52+ vs CD52- cells, and compare the proportions of CD52+ cells between edited and unedited samples. We can observe that CD52 KO is not 100% efficient, with ~25% CD52+ cells still present in the edited samples.
+
+```{r define-cd52-status}
+# histogram of CD52 expression
+ggplot(df, aes(x=CD52)) + 
+  geom_histogram(bins=50, fill="lightblue", color="black") +
+  geom_vline(xintercept=2, color="red", linetype="dashed") +
+  theme_minimal() +
+  ggtitle("Distribution of CD52 expression")
+
+# define cell as CD52+ if CD52 expression > 2, otherwise CD52-
+df <- df %>%
+  mutate(CD52_status = ifelse(CD52 >= 2, "CD52+", "CD52-"))
+
+tab <- as.data.frame(table(df$CD52_status, df$condition))
+colnames(tab) <- c("CD52", "Condition", "Count")
+ggplot(tab, aes(x = Condition, y = Count, fill = CD52)) +
+  geom_bar(stat = "identity", position = "fill", width=0.5) +
+  ylab("Proportion") +
+  theme_minimal()
+
+```
+
+# Compare edited vs unedited samples within T cell subtypes
+We used the provided cell type annotations to perform differential abundance (DA) and differential state (DS) analyses, comparing edited versus unedited samples within CD52⁺ cells as a sanity check. Statistical testing was conducted using the diffcyt package.
+For differential abundance analysis, we applied the edgeR framework to assess differences in the proportions of each T cell subtype between conditions. For differential state analysis, we utilized the voom + limma approach to evaluate changes in the expression levels of measured markers within each T cell subtype. 
+
+The working hypothesis is that no significant differences will be observed in either cell type proportions or marker expression between the edited and unedited samples. This expectation is based on the assumption that the editing procedure does not introduce systematic effects on cellular composition or functional marker profiles within the CD52⁺ population.
+
+T cell subtypes with less than 1000 cells are excluded from the analysis to ensure sufficient power, and the ambiguously labeled TCRab+ cells are also excluded.
+```{r subset-tcell-subtypes}
+# exclude subtypes with < 1000 cells and the ambiguously labeled TCRab+ cells
+subtypes <- c("CD4+ CM", "CD4+ EM", "CD4+ Naive", "CD4+ TE", "CD8+ EM", "CD8+ TE", "CD4+ Th1","CD4+ TFH", "TCRgd+")
+df <- df %>%
+  dplyr::filter(celltype %in% subtypes)
+```
+
+## CD52+ cells
+CD52+ CD4 central memory T cells were the only subtype found to be significantly more abundant in the edited samples compared to the unedited controls (FDR = 0.007). As for differential states, only CD52 exhitibed significant downregulation in the edited samples, which is expected. 
+```{r compare-cd52-positive, fig.width=16, fig.height=8}
+cd52plus_df <- df %>%
+  dplyr::filter(CD52_status == "CD52+" & condition %in% c("unedited", "edited")) %>%
+  mutate(
+    group = case_when(
+      CD52_status == "CD52+" & condition == "unedited" ~ "CD52+ control",
+      CD52_status == "CD52+" & condition == "edited" ~ "CD52+ KO"),
+  )
+
+res_cd52plus <- run_diffcyt_analysis(
+  df = cd52plus_df,
+  sample_col = "sample",
+  group_col = "group",
+  celltype_col = "celltype"
+)
+
+head(res_cd52plus$res_DA, 10)
+write_csv(res_cd52plus$res_DA, file.path(results_dir, "control_vs_KO_cd52plus_diff_abundance_results.csv"))
+head(res_cd52plus$res_DS, 10)
+write_csv(res_cd52plus$res_DS, file.path(results_dir, "control_vs_KO_cd52plus_diff_state_results.csv"))
+```
+
+```{r visualize-da-results-1, fig.width=16, fig.height=12}
+plot_da_boxplot(
+  df = cd52plus_df,
+  res_da_tbl = res_cd52plus$res_DA
+)
+
+ggsave(file.path(plot_dir, "control_vs_KO_cd52plus_diff_abundance_boxplots.png"), width = 16, height = 12)
+```
+
+```{r visualize-ds-results-1, fig.width=16, fig.height=16}
+volplots <- lapply(unique(res_cd52plus$res_DS$celltype), function(ct) {
+  plot_ds_volcano(res_cd52plus$res_DS, celltype_name = ct)
+})
+wrap_plots(volplots)
+
+ggsave(file.path(plot_dir, "control_vs_KO_cd52plus_diff_state_volcano_plots.png"), width = 16, height = 16)
+```
+
+## CD52- cells
+CD52- CD4+ terminal effector and naive T cells were significantly more abundant in the edited samples, whereas CD52- gamma delta T cells were significantly depleted. For differential states, no protein markers exhibited significant differences.
+
+The observed DA differences are modest and not accompanied by any corresponding DS changes, suggesting they are more likely driven by sampling variability, clustering resolution, or compositional effects rather than true biological differences introduced by editing.
+```{r compare-cd52-negative, fig.width=16, fig.height=8}
+cd52neg_df <- df %>%
+  dplyr::filter(CD52_status == "CD52-" & condition %in% c("unedited", "edited")) %>%
+  mutate(
+    group = case_when(
+      CD52_status == "CD52-" & condition == "unedited" ~ "CD52+ control",
+      CD52_status == "CD52-" & condition == "edited" ~ "CD52+ KO"),
+  )
+
+res_cd52neg <- run_diffcyt_analysis(
+  df = cd52neg_df,
+  sample_col = "sample",
+  group_col = "group",
+  celltype_col = "celltype"
+)
+
+head(res_cd52neg$res_DA, 10)
+write_csv(res_cd52neg$res_DA, file.path(results_dir, "control_vs_KO_cd52neg_diff_abundance_results.csv"))
+head(res_cd52neg$res_DA, 10)
+write_csv(res_cd52neg$res_DS, file.path(results_dir, "control_vs_KO_cd52neg_diff_state_results.csv"))
+```
+
+```{r visualize-da-results-2, fig.width=16, fig.height=12}
+plot_da_boxplot(
+  df = cd52neg_df,
+  res_da_tbl = res_cd52neg$res_DA
+)
+
+ggsave(file.path(plot_dir, "control_vs_KO_cd52neg_diff_abundance_boxplots.png"), width = 16, height = 12)
+```
+
+```{r visualize-ds-results-2, fig.width=16, fig.height=16}
+volplots <- lapply(unique(res_cd52neg$res_DS$celltype), function(ct) {
+  plot_ds_volcano(res_cd52neg$res_DS, celltype_name = ct)
+})
+wrap_plots(volplots)
+
+ggsave(file.path(plot_dir, "control_vs_KO_cd52neg_diff_state_volcano_plots.png"), width = 16, height = 16)
+```
+
+# CD52- vs CD52+ cells within edited and unedited samples
+## KO samples
+The following cell types were identified as significantly more abundant in CD52⁺ relative to CD52⁻ populations within the edited samples: CD4⁺ terminal effector, CD4⁺ central memory, and CD4⁺ T follicular helper cells. No significant differential state (DS) changes were detected across any cell types, with the exception of CD52 itself.
+```{r compare-cd52-status-within-edited, fig.width=16, fig.height=8}
+edited_df <- df %>%
+  dplyr::filter(condition == "edited")
+
+res_edited <- run_diffcyt_analysis(
+  df = edited_df,
+  sample_col = "sample",
+  group_col = "CD52_status",
+  celltype_col = "celltype",
+  non_marker_cols = c("cell_id", "optsne_1", "optsne_2",
+                        "sample", "condition", "fsom_metaclust","celltype", "CD52_status")
+)
+
+head(res_edited$res_DA, 10)
+write_csv(res_edited$res_DA, file.path(results_dir, "cd52plus_vs_cd52neg_KO_diff_abundance_results.csv"))
+head(res_edited$res_DS, 10)
+write_csv(res_edited$res_DS, file.path(results_dir, "cd52plus_vs_cd52neg_KO_diff_state_results.csv"))
+```
+```{r visualize-da-results-3, fig.width=16, fig.height=12}
+plot_da_boxplot(
+  df = edited_df,
+  res_da_tbl = res_edited$res_DA,
+  group_col = "CD52_status"
+)
+
+ggsave(file.path(plot_dir, "cd52plus_vs_cd52neg_KO_diff_abundance_boxplots.png"), width = 16, height = 12)
+```
+
+```{r visualize-ds-results-3, fig.width=16, fig.height=16}
+volplots <- lapply(unique(res_edited$res_DS$celltype), function(ct) {
+  plot_ds_volcano(res_edited$res_DS, celltype_name = ct)
+})
+wrap_plots(volplots)
+
+ggsave(file.path(plot_dir, "cd52plus_vs_cd52neg_KO_diff_state_volcano_plots.png"), width = 16, height = 16)
+```
+
+### Add a plot that visualize overall changes in CD4 vs CD8 T cell subsets between CD52+ and CD52- populations within the edited samples, to provide a more comprehensive overview of the observed DA differences.
+
+```{r visualize-cd4-cd8-changes, fig.width=8, fig.height=6}
+cd4_cd8_df <- edited_df %>%
+  filter(celltype != "TCRgd+") %>%
+  mutate(
+    Lineage = case_when(
+      grepl("^CD4", celltype) ~ "CD4+",
+      grepl("^CD8", celltype) ~ "CD8+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Lineage)) %>%
+  group_by(sample, CD52_status, Lineage) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(sample, CD52_status) %>%
+  mutate(Proportion = count / sum(count)) %>%
+  ungroup()
+
+ggplot(cd4_cd8_df, aes(x = CD52_status, y = Proportion, fill = Lineage)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = NA) +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+    size = 2
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "CD52 Status", 
+       title = "CD4 vs CD8 T Cell Composition by CD52 Status within Edited Samples")+
+  theme_minimal()
+
+ggsave(file.path(plot_dir, "cd4_cd8_composition_by_cd52_status_edited_samples.png"), 
+       width = 8, height = 6)
+```
+
+## control samples
+CD4+ terminal effector T cells are significantly more abundant in CD52+ vs CD52- cells within the unedited samples, , while no significant differences in marker expression were observed.
+
+```{r compare-cd52-status-within-unedited, fig.width=16, fig.height=8}
+unedited_df <- df %>%
+  dplyr::filter(condition == "unedited")
+
+res_unedited <- run_diffcyt_analysis(
+  df = unedited_df,
+  sample_col = "sample",
+  group_col = "CD52_status",
+  celltype_col = "celltype",
+  non_marker_cols = c("cell_id", "optsne_1", "optsne_2",
+                        "sample", "condition", "fsom_metaclust","celltype", "CD52_status")
+)
+
+head(res_unedited$res_DA, 10)
+write_csv(res_unedited$res_DA, file.path(results_dir, "cd52plus_vs_cd52neg_control_diff_abundance_results.csv"))
+head(res_unedited$res_DS, 10)
+write_csv(res_unedited$res_DS, file.path(results_dir, "cd52plus_vs_cd52neg_control_diff_state_results.csv"))
+```
+
+```{r visualize-da-results-4, fig.width=16, fig.height=12}
+plot_da_boxplot(
+  df = unedited_df,
+  res_da_tbl = res_unedited$res_DA,
+  group_col = "CD52_status"
+)
+
+ggsave(file.path(plot_dir, "cd52plus_vs_cd52neg_control_diff_abundance_boxplots.png"), width = 16, height = 12)
+```
+
+```{r visualize-ds-results-4, fig.width=16, fig.height=16}
+volplots <- lapply(unique(res_unedited$res_DS$celltype), function(ct) {
+  plot_ds_volcano(res_unedited$res_DS, celltype_name = ct)
+})
+wrap_plots(volplots)
+
+ggsave(file.path(plot_dir, "cd52plus_vs_cd52neg_control_diff_state_volcano_plots.png"), width = 16, height = 16)
+```
+
+```{r combined-boxplot, fig.width=16, fig.height=12}
+res_edited_tbl <- res_edited$res_DA %>%
+  mutate(condition="KO")
+
+res_unedited_tbl <- res_unedited$res_DA %>%
+  mutate(condition="Control")
+
+res_combined <- dplyr::bind_rows(res_edited_tbl, res_unedited_tbl)
+
+plot_da_boxplot_combined <- function(
+    df,
+    res_da_tbl,
+    sample_col = "sample",
+    condition_col = "condition",
+    cd52_col = "CD52_status",
+    celltype_col = "celltype",
+    p_col = "p_adj"
+) {
+
+
+  ## ---------------------------
+  ## 1. Prepare p-values (by condition)
+  ## ---------------------------
+  pvals <- res_da_tbl %>%
+    dplyr::select(cluster_id, condition, !!p_col) %>%
+    dplyr::mutate(
+      celltype = cluster_id,
+      label = paste0(condition, ": FDR = ", signif(.data[[p_col]], 2))
+    ) %>%
+    dplyr::group_by(celltype) %>%
+    dplyr::summarise(
+      label = paste(label, collapse = "\n"),
+      .groups = "drop"
+    )
+
+  ## ---------------------------
+  ## 2. Compute proportions
+  ## ---------------------------
+  df_prop <- df %>%
+  dplyr::count(!!sym(sample_col),
+               !!sym(condition_col),
+               !!sym(cd52_col),
+               !!sym(celltype_col)) %>%
+  mutate(celltype = as.character(celltype)) %>%
+  tidyr::complete(
+    !!sym(sample_col),
+    !!sym(condition_col),
+    !!sym(cd52_col),
+    !!sym(celltype_col),
+    fill = list(n = 0)
+  ) %>%
+  dplyr::group_by(!!sym(sample_col),
+                  !!sym(condition_col),
+                  !!sym(cd52_col)) %>%
+  dplyr::mutate(prop = n / sum(n)) %>%
+  dplyr::ungroup()
+
+
+  df_prop <- df_prop %>%
+    mutate(
+      !!condition_col := recode(
+        .data[[condition_col]],
+        "unedited" = "Control",
+        "edited" = "KO"
+      )
+    )
+
+  ## ---------------------------
+  ## 3. Plot
+  ## ---------------------------
+  ggplot(df_prop, aes(
+    x = .data[[condition_col]],
+    y = prop,
+    fill = .data[[cd52_col]]
+  )) +
+    geom_boxplot(
+      outlier.shape = NA,
+      width = 0.6,
+      position = position_dodge(width = 0.7)
+    ) +
+    geom_jitter(
+      position = position_jitterdodge(
+        jitter.width = 0.15,
+        dodge.width = 0.7
+      ),
+      size = 1.5,
+      alpha = 0.8
+    ) +
+    facet_wrap(as.formula(paste("~", celltype_col)), scales = "free_y") +
+    geom_text(
+      data = pvals,
+      aes(x = 1.9, y = Inf, label = label),
+      inherit.aes = FALSE,
+      hjust = 1.1,
+      vjust = 1.5,
+      size = 3.5
+    ) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(values = c("CD52-" = "#F8766D", "CD52+" = "#00BFC4")) +
+    theme_classic(base_size = 16) +
+    labs(
+      x = "Condition",
+      y = "Proportion",
+      fill = "CD52 status",
+      title = "Differential Abundance of Cell Types"
+    ) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+plot_da_boxplot_combined(
+  df = df,  
+  res_da_tbl = res_combined
+)
+
+ggsave(file.path(plot_dir, "combined_cd52plus_vs_cd52neg_diff_abundance_boxplots.png"), 
+       width = 16, height = 12)
+```
+
+## Takeaways
+Overall, these differential abundance (DA) patterns likely reflect inherent compositional differences between CD52⁺ and CD52⁻ compartments rather than effects driven by the editing perturbation. The presence of similar abundance shifts in both edited and unedited samples, together with the absence of corresponding DS changes, suggests that these differences are not associated with functional alterations in cell state but instead arise from baseline population structure related to CD52 expression.
+
+```{r session-info}
+sessionInfo()
+```
